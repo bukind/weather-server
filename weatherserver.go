@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"crypto/subtle"
 	"database/sql"
 	_ "embed"
@@ -13,9 +14,11 @@ import (
 	"io"
 	"io/fs"
 	"log"
+	"maps"
 	"net/http"
 	"os"
 	"path"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -152,37 +155,27 @@ func (d Data) IsEmpty() bool {
 	return d.empty
 }
 
-func (d Data) Write(w io.Writer) error {
+func (d Data) Write(w http.ResponseWriter) error {
 	// Note: the first Next() is already called at the time of creation.
-	if _, err := w.Write([]byte{'['}); err != nil {
-		return err
-	}
-	for i := 0; ; i++ {
-		sep := []byte{',', '\n'}
-		sepStart := 0
-		if i == 0 {
-			sepStart = 1
-		}
-		if _, err := w.Write(sep[sepStart:2]); err != nil {
-			return err
-		}
+	buf := &bytes.Buffer{}
+	buf.WriteString("#time,temperature,pressure,humidity\n")
+	count := 0
+	for {
+		count++
 		var rd Record
 		if err := d.rows.Scan(&rd.Time, &rd.Temperature, &rd.Pressure, &rd.Humidity); err != nil {
 			return err
 		}
-		b, err := rd.ToJson()
-		if err != nil {
-			return err
-		}
-		if _, err := w.Write(b); err != nil {
+		if _, err := buf.WriteString(rd.String() + "\n"); err != nil {
 			return err
 		}
 		if !d.rows.Next() {
 			break
 		}
 	}
-	_, err := w.Write([]byte{'\n', ']'})
-	return err
+	log.Printf("written %d rows", count)
+	w.Write(buf.Bytes())
+	return nil
 }
 
 func (d Data) Close() {
@@ -220,7 +213,9 @@ func (d *reqHandler) ServeMux() *http.ServeMux {
 func (d reqHandler) handleIndex(w http.ResponseWriter, r *http.Request) {
 	log.Printf("handling index")
 	w.WriteHeader(http.StatusOK)
-	indexTemplate.Execute(w, d.store)
+	indexTemplate.Execute(w, map[string]any{
+		"Sensors": slices.Collect(maps.Keys(d.store.Sensors())),
+	})
 }
 
 func (d reqHandler) handleStatic(w http.ResponseWriter, r *http.Request) {
@@ -235,7 +230,6 @@ func parseReqDates(r *http.Request) (time.Time, time.Time, error) {
 		return endDate, endDate, fmt.Errorf("failed to parse request: %v", err)
 	}
 
-	log.Printf("handling data %q", r.PathValue("objectname"))
 	if ed := r.Form.Get("enddate"); ed != "" {
 		et, err := time.Parse(time.DateOnly, ed)
 		if err != nil {
@@ -261,28 +255,38 @@ func parseReqDates(r *http.Request) (time.Time, time.Time, error) {
 	return endDate.Add(-time.Duration(days) * time.Hour * 24), endDate, nil
 }
 
+func httpError(w http.ResponseWriter, msg string, code int) {
+	log.Printf("HTTP error %d: %s", code, msg)
+	http.Error(w, msg, code)
+}
+
 func (d reqHandler) handleData(w http.ResponseWriter, r *http.Request) {
+	log.Printf("handling data %q, uri=%q", r.PathValue("sensor"), r.RequestURI)
 	startDate, endDate, err := parseReqDates(r)
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
+		httpError(w, err.Error(), http.StatusBadRequest)
 		return
 	}
 	sensor := r.PathValue("sensor")
+	log.Printf("sensor %s, start %s, end %s", sensor, startDate, endDate)
 	if _, ok := d.store.Sensors()[sensor]; !ok {
-		http.Error(w, fmt.Sprintf("unknown sensor %q", sensor), http.StatusBadRequest)
+		httpError(w, fmt.Sprintf("unknown sensor %q", sensor), http.StatusBadRequest)
 		return
 	}
 	data, err := d.store.ReadData(sensor, startDate, endDate)
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusPreconditionFailed)
+		httpError(w, err.Error(), http.StatusPreconditionFailed)
 		return
 	}
 	if data.IsEmpty() {
-		http.Error(w, fmt.Sprintf("no data found for sensor %q in the range of [%s..%s]", sensor, startDate, endDate), http.StatusNotFound)
+		httpError(w, fmt.Sprintf("no data found for sensor %q in the range of [%s..%s]", sensor, startDate, endDate), http.StatusNotFound)
 		return
 	}
+	w.Header().Set("content-type", "text/csv")
 	w.WriteHeader(http.StatusOK)
-	data.Write(w)
+	if err := data.Write(w); err != nil {
+		log.Printf("failed to write: %v", err)
+	}
 }
 
 func basicAuth(next http.HandlerFunc, user, pass string) http.HandlerFunc {
@@ -326,33 +330,10 @@ type Record struct {
 }
 
 func (r Record) String() string {
-	return fmt.Sprintf("%s T=%v P=%v H=%v", r.Time.Format(timeFormat), r.Temperature, r.Pressure, r.Humidity)
-}
-
-func (r Record) ToJson() ([]byte, error) {
-	return json.Marshal(&r)
+	return fmt.Sprintf("%s,%v,%v,%v", r.Time.Format(timeFormat), r.Temperature, r.Pressure, r.Humidity)
 }
 
 type Records []Record
-
-// TODO: drop this.
-func showJson(recs []Record) {
-	res := []byte{'['}
-	for i, r := range recs {
-		if i != 0 {
-			res = append(res, ',')
-		}
-		res = append(res, '\n')
-		b, err := r.ToJson()
-		if err != nil {
-			log.Printf("failed to marshal json: %v", err)
-			return
-		}
-		res = append(res, b...)
-	}
-	res = append(res, '\n', ']')
-	fmt.Println(string(res))
-}
 
 // Relative path for a tag: tag/YYYY-MM-DD/HH/M0.csv
 func dataPath(tag string, t time.Time) string {
@@ -411,11 +392,6 @@ func main() {
 	user := flag.String("user", "user", "Username")
 	pass := flag.String("password", "password", "Password")
 	flag.Parse()
-
-	showJson([]Record{
-		{Time: time.Now().Add(-time.Hour), Temperature: 28.1, Pressure: 100700.1, Humidity: 65.2},
-		{Time: time.Now(), Temperature: 29.1, Pressure: 101000.1, Humidity: 70.3},
-	})
 
 	store, err := newDataStorage(*dataPath)
 	if err != nil {
