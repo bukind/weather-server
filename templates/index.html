@@ -1,0 +1,17 @@
+<html>
+<head>
+<title>Sensors</title>
+</head>
+<body>
+<h1>The following sensors can be viewed</h1>
+<ul>
+{{ range .Sensors }}
+<li>{{.}} :
+  <a href="/static/sensor.html?name={{.}}&days=1">[1 day]</a>
+  <a href="/static/sensor.html?name={{.}}&days=3">[3 days]</a>
+  <a href="/static/sensor.html?name={{.}}&days=7">[7 days]</a>
+</li>
+{{ end }}
+</ul>
+</body>
+</html>
