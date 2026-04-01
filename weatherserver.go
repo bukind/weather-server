@@ -335,18 +335,25 @@ func (r Record) String() string {
 
 type Records []Record
 
-// Relative path for a tag: tag/YYYY-MM-DD/HH/M0.csv
-func dataPath(tag string, t time.Time) string {
-	return fmt.Sprintf("%s/%s/%02d/%02d.csv", tag, t.Format(time.DateOnly), t.Hour(), (t.Minute()/10)*10)
-}
-
 func (d reqHandler) postData(w http.ResponseWriter, r *http.Request) {
-	sensor := r.PathValue("sensor")
-	// TODO: add a check for sensor validity.
-	//if _, ok := d.store.Sensors()[sensor]; !ok {
-	// http.Error(w, fmt.Sprintf("unknown sensor %q", sensor), http.StatusBadRequest)
-	// return
-	// }
+	sensor := strings.ToLower(r.PathValue("sensor"))
+	if len(sensor) != 12 {
+		// We only accept MAC address, which should have 12 hex digits.
+		http.Error(w, "bad tag: should have 12 hex digits", http.StatusBadRequest)
+		return
+	}
+	if strings.ContainsFunc(sensor, func(r rune) bool {
+		switch {
+		case r >= '0' && r <= '9':
+			return false
+		case r >= 'a' && r <= 'f':
+			return false
+		}
+		return true
+	}) {
+		http.Error(w, "bad tag: contains not a hex digit", http.StatusBadRequest)
+		return
+	}
 
 	body, err := io.ReadAll(r.Body)
 	if err != nil {
@@ -370,7 +377,6 @@ func (d reqHandler) postData(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	log.Printf("data posted for sensor %q: %s", sensor, rd)
-
 }
 
 func handleFS(w http.ResponseWriter, fn string, fsys fs.FS, what string) {
