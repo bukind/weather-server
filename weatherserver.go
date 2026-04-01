@@ -62,14 +62,17 @@ func newDataStorage(dataPath string) (*dataStorage, error) {
 		timestamp DATETIME,
 		temperature FLOAT,
 		pressure FLOAT,
-		humidity FLOAT
+		humidity FLOAT,
+		cnt INTEGER DEFAULT 1,
+		temperature_error FLOAT,
+		pressure_error FLOAT,
+		humidity_error FLOAT
 	);
 	`
 	if _, err := db.Exec(createData); err != nil {
 		db.Close()
 		return nil, fmt.Errorf("failed to create measurements table: %v", err)
 	}
-
 	return &dataStorage{
 		db: db,
 	}, nil
