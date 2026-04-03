@@ -160,10 +160,10 @@ func (d *dataStorage) StoreRecord(ctx context.Context, sensor string, rd Record)
 }
 
 // Remove all rows with the same squeezed_by from squeezed.
-func removeSqueezedBy(tx *sql.Tx, secondsToSqueeze int64, startTime, endTime time.Time) error {
+func (s squeezer) removeSqueezedBy() error {
 	log.Printf("removing previously squeezed rows from squeezed")
 	query := `DELETE FROM squeezed WHERE squeezed_by = ? AND timestamp >= ? AND timestamp < ?;`
-	res, err := tx.Exec(query, secondsToSqueeze, startTime, endTime)
+	res, err := s.tx.Exec(query, s.secondsToSqueeze, s.startTime, s.endTime)
 	if err != nil {
 		return err
 	}
@@ -172,8 +172,8 @@ func removeSqueezedBy(tx *sql.Tx, secondsToSqueeze int64, startTime, endTime tim
 	return nil
 }
 
-func readSqueezedData(tx *sql.Tx, secondsToSqueeze int64, startTime, endTime time.Time) (Data, error) {
-	log.Printf("reading squeeze data in the interval [%s,%s]", startTime, endTime)
+func (s squeezer) readSqueezedData() (Data, error) {
+	log.Printf("reading squeeze data in the interval [%s,%s]", s.startTime, s.endTime)
 	query := `SELECT
 	sensor_id,
 	STRFTIME("%s", timestamp)/?*?+? AS seconds_mean,
@@ -189,7 +189,7 @@ func readSqueezedData(tx *sql.Tx, secondsToSqueeze int64, startTime, endTime tim
 	GROUP BY sensor_id, seconds_mean
 	ORDER BY sensor_id, seconds_mean;
 	`
-	rows, err := tx.Query(query, secondsToSqueeze, secondsToSqueeze, secondsToSqueeze/2, secondsToSqueeze, startTime, endTime)
+	rows, err := s.tx.Query(query, s.secondsToSqueeze, s.secondsToSqueeze, s.secondsToSqueeze/2, s.secondsToSqueeze, s.startTime, s.endTime)
 	if err != nil {
 		return Data{}, fmt.Errorf("failed to read squeezed data: %v", err)
 	}
@@ -198,9 +198,10 @@ func readSqueezedData(tx *sql.Tx, secondsToSqueeze int64, startTime, endTime tim
 	}, nil
 }
 
-func insertSqueezed(tx *sql.Tx, data Data, secondsToSqueeze int64) error {
+func (s squeezer) insertSqueezed(data Data) (bool, error) {
+	defer data.Close()
 	log.Printf("inserting squeeze data")
-	stm, err := tx.Prepare(`INSERT INTO squeezed (
+	stm, err := s.tx.Prepare(`INSERT INTO squeezed (
 		sensor_id,
 		timestamp,
 		temperature,
@@ -224,7 +225,7 @@ func insertSqueezed(tx *sql.Tx, data Data, secondsToSqueeze int64) error {
 		?
 	);`)
 	if err != nil {
-		return err
+		return false, err
 	}
 	defer stm.Close()
 	rows := 0
@@ -240,7 +241,7 @@ func insertSqueezed(tx *sql.Tx, data Data, secondsToSqueeze int64) error {
 		var hum2Sum float64
 		ok, err := data.Read(&sensorID, &seconds, &count, &tempSum, &temp2Sum, &pressSum, &press2Sum, &humSum, &hum2Sum)
 		if err != nil {
-			return err
+			return false, err
 		}
 		if !ok {
 			break
@@ -254,18 +255,18 @@ func insertSqueezed(tx *sql.Tx, data Data, secondsToSqueeze int64) error {
 			humMean = humSum / float64(count)
 			humSig2 = math.Max(hum2Sum/float64(count)-humMean*humMean, 0.)
 		}
-		if _, err := stm.Exec(sensorID, time.Unix(seconds, 0), tempMean, pressMean, humMean, count, tempSig2, pressSig2, humSig2, secondsToSqueeze); err != nil {
-			return err
+		if _, err := stm.Exec(sensorID, time.Unix(seconds, 0), tempMean, pressMean, humMean, count, tempSig2, pressSig2, humSig2, s.secondsToSqueeze); err != nil {
+			return false, err
 		}
 	}
 	log.Printf("inserted %d rows", rows)
-	return nil
+	return rows > 0, nil
 }
 
-func removeSubSqueezed(tx *sql.Tx, secondsToSqueeze int64, startTime, endTime time.Time) error {
+func (s squeezer) removeSubSqueezed() error {
 	log.Printf("removing squeezed rows from measurements")
 	query := `DELETE FROM measurements WHERE squeezed_by < ? AND timestamp >= ? AND timestamp < ?;`
-	res, err := tx.Exec(query, secondsToSqueeze, startTime, endTime)
+	res, err := s.tx.Exec(query, s.secondsToSqueeze, s.startTime, s.endTime)
 	if err != nil {
 		return err
 	}
@@ -274,13 +275,13 @@ func removeSubSqueezed(tx *sql.Tx, secondsToSqueeze int64, startTime, endTime ti
 	return nil
 }
 
-func moveSqueezedData(tx *sql.Tx, secondsToSqueeze int64, startTime, endTime time.Time) error {
+func (s squeezer) moveSqueezedData() error {
 	log.Printf("moving squeezed rows from squeezed into measurements")
 	query := `INSERT INTO measurements
 	SELECT * FROM squeezed
 	WHERE squeezed_by = ? AND timestamp >= ? AND timestamp < ?;
 	`
-	res, err := tx.Exec(query, secondsToSqueeze, startTime, endTime)
+	res, err := s.tx.Exec(query, s.secondsToSqueeze, s.startTime, s.endTime)
 	if err != nil {
 		return err
 	}
@@ -289,54 +290,79 @@ func moveSqueezedData(tx *sql.Tx, secondsToSqueeze int64, startTime, endTime tim
 	return nil
 }
 
-func (d *dataStorage) squeezeWithTx(tx *sql.Tx, interval time.Duration, endTime time.Time) error {
+func (s squeezer) Exec() (err error) {
+	start := time.Now()
+	defer func() {
+		log.Printf("squeeze completed in %s", time.Now().Sub(start))
+	}()
+	defer func() {
+		if err != nil {
+			err = errors.Join(err, s.tx.Rollback())
+		} else {
+			err = s.tx.Commit()
+		}
+	}()
+
+	// Remove previously squeezed data, if any.
+	if err := s.removeSqueezedBy(); err != nil {
+		return err
+	}
+	// Read data from measurements.
+	data, err := s.readSqueezedData()
+	if err != nil {
+		return err
+	}
+	// Insert rows into squeezed.
+	if ok, err := s.insertSqueezed(data); err != nil || !ok {
+		return err
+	}
+	if err := s.removeSubSqueezed(); err != nil {
+		return err
+	}
+	// Move rows from squeezed to measurements.
+	return s.moveSqueezedData()
+}
+
+type squeezer struct {
+	tx               *sql.Tx
+	secondsToSqueeze int64
+	startTime        time.Time
+	endTime          time.Time
+}
+
+func (d *dataStorage) Squeeze(interval time.Duration, endTime time.Time) error {
+	s, err := d.newSqueezer(interval, endTime)
+	if err != nil {
+		return err
+	}
+	return s.Exec()
+}
+
+func (d *dataStorage) newSqueezer(interval time.Duration, endTime time.Time) (squeezer, error) {
 	if interval <= time.Second {
-		return fmt.Errorf("interval %s is too small for squeeze", interval)
+		return squeezer{}, fmt.Errorf("interval %s is too small for squeeze", interval)
 	}
 	if interval/(2*time.Second)*(2*time.Second) != interval {
-		return fmt.Errorf("interval %s is not multiple of a (two seconds)", interval)
+		return squeezer{}, fmt.Errorf("interval %s is not multiple of a (two seconds)", interval)
 	}
 	if time.Hour/interval*interval != time.Hour {
-		return fmt.Errorf("interval %s is not a factor or an hour", interval)
+		return squeezer{}, fmt.Errorf("interval %s is not a factor or an hour", interval)
 	}
 	secondsToSqueeze := int64(interval / time.Second)
 	endTime = endTime.Truncate(time.Hour)
 	// TODO: drop start time when tested.
 	startTime := endTime.Add(-time.Hour * 48)
-	// Remove previously squeezed data, if any.
-	if err := removeSqueezedBy(tx, secondsToSqueeze, startTime, endTime); err != nil {
-		return err
-	}
-	// Read data from measurements.
-	data, err := readSqueezedData(tx, secondsToSqueeze, startTime, endTime)
-	if err != nil {
-		return err
-	}
-	defer data.Close()
-	// Insert rows into squeezed.
-	if err := insertSqueezed(tx, data, secondsToSqueeze); err != nil {
-		return err
-	}
-	if err := removeSubSqueezed(tx, secondsToSqueeze, startTime, endTime); err != nil {
-		return err
-	}
-	// Move rows from squeezed to measurements.
-	return moveSqueezedData(tx, secondsToSqueeze, startTime, endTime)
-}
 
-func (d *dataStorage) Squeeze(seconds time.Duration, endTime time.Time) error {
-	start := time.Now()
-	defer func() {
-		log.Printf("squeeze completed in %s", time.Now().Sub(start))
-	}()
 	tx, err := d.db.Begin()
 	if err != nil {
-		return err
+		return squeezer{}, err
 	}
-	if err := d.squeezeWithTx(tx, seconds, endTime); err != nil {
-		return errors.Join(err, tx.Rollback())
-	}
-	return tx.Commit()
+	return squeezer{
+		tx:               tx,
+		secondsToSqueeze: secondsToSqueeze,
+		startTime:        startTime,
+		endTime:          endTime,
+	}, nil
 }
 
 type Data struct {
