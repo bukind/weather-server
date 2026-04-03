@@ -2,11 +2,13 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"crypto/subtle"
 	"database/sql"
 	_ "embed"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	_ "github.com/mattn/go-sqlite3"
@@ -15,6 +17,7 @@ import (
 	"io/fs"
 	"log"
 	"maps"
+	"math"
 	"net/http"
 	"os"
 	"path"
@@ -56,19 +59,25 @@ func newDataStorage(dataPath string) (*dataStorage, error) {
 		return nil, fmt.Errorf("failed to create sensors table: %v", err)
 	}
 
-	createData := `
-	CREATE TABLE IF NOT EXISTS measurements (
+	tableSpec := `(
 		sensor_id INTEGER,
 		timestamp DATETIME,
 		temperature FLOAT,
 		pressure FLOAT,
 		humidity FLOAT,
 		cnt INTEGER DEFAULT 1,
-		temperature_error FLOAT,
-		pressure_error FLOAT,
-		humidity_error FLOAT
-	);
-	`
+		temperature_sigma2 FLOAT DEFAULT 0,
+		pressure_sigma2 FLOAT DEFAULT 0,
+		humidity_sigma2 FLOAT DEFAULT 0,
+		squeezed_by INTEGER DEFAULT 1
+	)`
+
+	createData := `CREATE TABLE IF NOT EXISTS measurements ` + tableSpec + `;`
+	if _, err := db.Exec(createData); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("failed to create measurements table: %v", err)
+	}
+	createData = `CREATE TABLE IF NOT EXISTS squeezed ` + tableSpec + `;`
 	if _, err := db.Exec(createData); err != nil {
 		db.Close()
 		return nil, fmt.Errorf("failed to create measurements table: %v", err)
@@ -84,6 +93,7 @@ func (d *dataStorage) Close() {
 
 // Return the list of available sensors.
 func (d *dataStorage) Sensors() map[string]int64 {
+	// TODO: replace with prepared statement.
 	query := `SELECT id, name FROM sensors;`
 	rows, err := d.db.Query(query)
 	if err != nil {
@@ -103,28 +113,28 @@ func (d *dataStorage) Sensors() map[string]int64 {
 	return result
 }
 
-func (d *dataStorage) ReadData(sensor string, startDate, endDate time.Time) (Data, error) {
+func (d *dataStorage) ReadData(ctx context.Context, sensor string, startDate, endDate time.Time) (Data, error) {
 	sensors := d.Sensors()
 	sensorID, ok := sensors[sensor]
 	if !ok {
 		return Data{}, fmt.Errorf("sensor %q is not found", sensor)
 	}
+	// TODO: replace with prepared statement.
 	query := `SELECT
 	timestamp, temperature, pressure, humidity
 	FROM measurements
 	WHERE sensor_id = ? AND timestamp >= ? AND timestamp <= ?
 	ORDER BY timestamp;`
-	rows, err := d.db.Query(query, sensorID, startDate, endDate)
+	rows, err := d.db.QueryContext(ctx, query, sensorID, startDate, endDate)
 	if err != nil {
 		return Data{}, fmt.Errorf("failed to read data for sensor %q: %v", sensor, err)
 	}
 	return Data{
-		rows:  rows,
-		empty: !rows.Next(),
+		rows: rows,
 	}, nil
 }
 
-func (d *dataStorage) StoreRecord(sensor string, rd Record) error {
+func (d *dataStorage) StoreRecord(ctx context.Context, sensor string, rd Record) error {
 	sensors := d.Sensors()
 	sensorID, ok := sensors[sensor]
 	if !ok {
@@ -149,42 +159,246 @@ func (d *dataStorage) StoreRecord(sensor string, rd Record) error {
 	return err
 }
 
-type Data struct {
-	rows  *sql.Rows
-	empty bool
-}
-
-func (d Data) IsEmpty() bool {
-	return d.empty
-}
-
-func (d Data) Write(w http.ResponseWriter) error {
-	// Note: the first Next() is already called at the time of creation.
-	buf := &bytes.Buffer{}
-	buf.WriteString("#time,temperature,pressure,humidity\n")
-	count := 0
-	for {
-		count++
-		var rd Record
-		if err := d.rows.Scan(&rd.Time, &rd.Temperature, &rd.Pressure, &rd.Humidity); err != nil {
-			return err
-		}
-		if _, err := buf.WriteString(rd.String() + "\n"); err != nil {
-			return err
-		}
-		if !d.rows.Next() {
-			break
-		}
+// Remove all rows with the same squeezed_by from squeezed.
+func removeSqueezedBy(tx *sql.Tx, secondsToSqueeze int64, startTime, endTime time.Time) error {
+	log.Printf("removing previously squeezed rows from squeezed")
+	query := `DELETE FROM squeezed WHERE squeezed_by = ? AND timestamp >= ? AND timestamp < ?;`
+	res, err := tx.Exec(query, secondsToSqueeze, startTime, endTime)
+	if err != nil {
+		return err
 	}
-	log.Printf("written %d rows", count)
-	w.Write(buf.Bytes())
+	rows, _ := res.RowsAffected()
+	log.Printf("%d rows removed", rows)
 	return nil
 }
 
+func readSqueezedData(tx *sql.Tx, secondsToSqueeze int64, startTime, endTime time.Time) (Data, error) {
+	log.Printf("reading squeeze data in the interval [%s,%s]", startTime, endTime)
+	query := `SELECT
+	sensor_id,
+	STRFTIME("%s", timestamp)/?*?+? AS seconds_mean,
+	SUM(cnt) AS row_count,
+	SUM(temperature*cnt) AS temperature_sum,
+	SUM((temperature*temperature + temperature_sigma2)*cnt) AS temperature_sum2,
+	SUM(pressure*cnt) AS pressure_sum,
+	SUM((pressure*pressure + pressure_sigma2)*cnt) AS pressure_sum2,
+	SUM(humidity*cnt) AS humidity_sum,
+	SUM((humidity*humidity + humidity_sigma2)*cnt) AS humidity_sum2
+	FROM measurements
+	WHERE squeezed_by < ? AND timestamp >= ? AND timestamp < ?
+	GROUP BY sensor_id, seconds_mean
+	ORDER BY sensor_id, seconds_mean;
+	`
+	rows, err := tx.Query(query, secondsToSqueeze, secondsToSqueeze, secondsToSqueeze/2, secondsToSqueeze, startTime, endTime)
+	if err != nil {
+		return Data{}, fmt.Errorf("failed to read squeezed data: %v", err)
+	}
+	return Data{
+		rows: rows,
+	}, nil
+}
+
+func insertSqueezed(tx *sql.Tx, data Data, secondsToSqueeze int64) error {
+	log.Printf("inserting squeeze data")
+	stm, err := tx.Prepare(`INSERT INTO squeezed (
+		sensor_id,
+		timestamp,
+		temperature,
+		pressure,
+		humidity,
+		cnt,
+		temperature_sigma2,
+		pressure_sigma2,
+		humidity_sigma2,
+		squeezed_by
+	) VALUES (
+		?,
+		?,
+		?,
+		?,
+		?,
+		?,
+		?,
+		?,
+		?,
+		?
+	);`)
+	if err != nil {
+		return err
+	}
+	defer stm.Close()
+	rows := 0
+	for ; ; rows++ {
+		var sensorID int
+		var seconds int64
+		var count int
+		var tempSum float64
+		var temp2Sum float64
+		var pressSum float64
+		var press2Sum float64
+		var humSum float64
+		var hum2Sum float64
+		ok, err := data.Read(&sensorID, &seconds, &count, &tempSum, &temp2Sum, &pressSum, &press2Sum, &humSum, &hum2Sum)
+		if err != nil {
+			return err
+		}
+		if !ok {
+			break
+		}
+		var tempMean, tempSig2, pressMean, pressSig2, humMean, humSig2 float64
+		if count > 0 {
+			tempMean = tempSum / float64(count)
+			tempSig2 = math.Max(temp2Sum/float64(count)-tempMean*tempMean, 0.)
+			pressMean = pressSum / float64(count)
+			pressSig2 = math.Max(press2Sum/float64(count)-pressMean*pressMean, 0.)
+			humMean = humSum / float64(count)
+			humSig2 = math.Max(hum2Sum/float64(count)-humMean*humMean, 0.)
+		}
+		if _, err := stm.Exec(sensorID, time.Unix(seconds, 0), tempMean, pressMean, humMean, count, tempSig2, pressSig2, humSig2, secondsToSqueeze); err != nil {
+			return err
+		}
+	}
+	log.Printf("inserted %d rows", rows)
+	return nil
+}
+
+func removeSubSqueezed(tx *sql.Tx, secondsToSqueeze int64, startTime, endTime time.Time) error {
+	log.Printf("removing squeezed rows from measurements")
+	query := `DELETE FROM measurements WHERE squeezed_by < ? AND timestamp >= ? AND timestamp < ?;`
+	res, err := tx.Exec(query, secondsToSqueeze, startTime, endTime)
+	if err != nil {
+		return err
+	}
+	rows, _ := res.RowsAffected()
+	log.Printf("%d rows removed", rows)
+	return nil
+}
+
+func moveSqueezedData(tx *sql.Tx, secondsToSqueeze int64, startTime, endTime time.Time) error {
+	log.Printf("moving squeezed rows from squeezed into measurements")
+	query := `INSERT INTO measurements
+	SELECT * FROM squeezed
+	WHERE squeezed_by = ? AND timestamp >= ? AND timestamp < ?;
+	`
+	res, err := tx.Exec(query, secondsToSqueeze, startTime, endTime)
+	if err != nil {
+		return err
+	}
+	rows, _ := res.RowsAffected()
+	log.Printf("%d rows inserted", rows)
+	return nil
+}
+
+func (d *dataStorage) squeezeWithTx(tx *sql.Tx, interval time.Duration, endTime time.Time) error {
+	if interval <= time.Second {
+		return fmt.Errorf("interval %s is too small for squeeze", interval)
+	}
+	if interval/(2*time.Second)*(2*time.Second) != interval {
+		return fmt.Errorf("interval %s is not multiple of a (two seconds)", interval)
+	}
+	if time.Hour/interval*interval != time.Hour {
+		return fmt.Errorf("interval %s is not a factor or an hour", interval)
+	}
+	secondsToSqueeze := int64(interval / time.Second)
+	endTime = endTime.Truncate(time.Hour)
+	// TODO: drop start time when tested.
+	startTime := endTime.Add(-time.Hour * 48)
+	// Remove previously squeezed data, if any.
+	if err := removeSqueezedBy(tx, secondsToSqueeze, startTime, endTime); err != nil {
+		return err
+	}
+	// Read data from measurements.
+	data, err := readSqueezedData(tx, secondsToSqueeze, startTime, endTime)
+	if err != nil {
+		return err
+	}
+	defer data.Close()
+	// Insert rows into squeezed.
+	if err := insertSqueezed(tx, data, secondsToSqueeze); err != nil {
+		return err
+	}
+	if err := removeSubSqueezed(tx, secondsToSqueeze, startTime, endTime); err != nil {
+		return err
+	}
+	// Move rows from squeezed to measurements.
+	return moveSqueezedData(tx, secondsToSqueeze, startTime, endTime)
+}
+
+func (d *dataStorage) Squeeze(seconds time.Duration, endTime time.Time) error {
+	start := time.Now()
+	defer func() {
+		log.Printf("squeeze completed in %s", time.Now().Sub(start))
+	}()
+	tx, err := d.db.Begin()
+	if err != nil {
+		return err
+	}
+	if err := d.squeezeWithTx(tx, seconds, endTime); err != nil {
+		return errors.Join(err, tx.Rollback())
+	}
+	return tx.Commit()
+}
+
+type Data struct {
+	rows *sql.Rows
+}
+
+// Close must be called on Data at the end of reading.
 func (d Data) Close() {
 	if d.rows != nil {
 		d.rows.Close()
 	}
+}
+
+// Read prepares the next row and reads it into the passed variables.
+// It returns:
+//   - (true, nil) on success,
+//   - (false, nil) on no data,
+//   - (false, err) on failure.
+func (d Data) Read(into ...any) (bool, error) {
+	if d.rows == nil {
+		return false, nil
+	}
+	ok := d.rows.Next()
+	if !ok {
+		return ok, d.rows.Err()
+	}
+	if err := d.rows.Scan(into...); err != nil {
+		d.rows.Close()
+		return false, err
+	}
+	return true, nil
+}
+
+func (d Data) Write(w http.ResponseWriter) error {
+	buf := &bytes.Buffer{}
+	buf.WriteString("#time,temperature,pressure,humidity\n")
+	count := 0
+	for {
+		var rd Record
+		ok, err := d.Read(&rd.Time, &rd.Temperature, &rd.Pressure, &rd.Humidity)
+		if err != nil {
+			httpError(w, fmt.Sprintf("failed to read: %v", err), http.StatusPreconditionFailed)
+			return err
+		}
+		if !ok {
+			if count == 0 {
+				httpError(w, "no data found in the range", http.StatusNotFound)
+				return nil
+			}
+			break
+		}
+		count++
+		if _, err := buf.WriteString(rd.String() + "\n"); err != nil {
+			httpError(w, fmt.Sprintf("failed to write buffer: %v", err), http.StatusPreconditionFailed)
+			return err
+		}
+	}
+	log.Printf("written %d rows", count)
+	w.Header().Set("content-type", "text/csv")
+	w.WriteHeader(http.StatusOK)
+	w.Write(buf.Bytes())
+	return nil
 }
 
 type reqHandler struct {
@@ -209,7 +423,7 @@ func (d *reqHandler) ServeMux() *http.ServeMux {
 	m.HandleFunc("GET /index.html", d.handleIndex)
 	m.HandleFunc("GET /static/{objectname...}", d.handleStatic)
 	m.HandleFunc("GET /data/{sensor}", d.handleData)
-	m.HandleFunc("POST /upload/{sensor}", basicAuth(d.postData, d.username, d.password))
+	m.HandleFunc("POST /upload/{sensor}", basicAuth(d.uploadSensorData, d.username, d.password))
 	return m
 }
 
@@ -224,7 +438,7 @@ func (d reqHandler) handleIndex(w http.ResponseWriter, r *http.Request) {
 func (d reqHandler) handleStatic(w http.ResponseWriter, r *http.Request) {
 	fn := r.PathValue("objectname")
 	log.Printf("handling static %q", fn)
-	handleFS(w, fn, d.staticFS, "static")
+	handleFS(r.Context(), w, fn, d.staticFS, "static")
 }
 
 func parseReqDates(r *http.Request) (time.Time, time.Time, error) {
@@ -276,17 +490,12 @@ func (d reqHandler) handleData(w http.ResponseWriter, r *http.Request) {
 		httpError(w, fmt.Sprintf("unknown sensor %q", sensor), http.StatusBadRequest)
 		return
 	}
-	data, err := d.store.ReadData(sensor, startDate, endDate)
+	data, err := d.store.ReadData(r.Context(), sensor, startDate, endDate)
 	if err != nil {
 		httpError(w, err.Error(), http.StatusPreconditionFailed)
 		return
 	}
-	if data.IsEmpty() {
-		httpError(w, fmt.Sprintf("no data found for sensor %q in the range of [%s..%s]", sensor, startDate, endDate), http.StatusNotFound)
-		return
-	}
-	w.Header().Set("content-type", "text/csv")
-	w.WriteHeader(http.StatusOK)
+	defer data.Close()
 	if err := data.Write(w); err != nil {
 		log.Printf("failed to write: %v", err)
 	}
@@ -338,7 +547,7 @@ func (r Record) String() string {
 
 type Records []Record
 
-func (d reqHandler) postData(w http.ResponseWriter, r *http.Request) {
+func (d reqHandler) uploadSensorData(w http.ResponseWriter, r *http.Request) {
 	sensor := strings.ToLower(r.PathValue("sensor"))
 	if len(sensor) != 12 {
 		// We only accept MAC address, which should have 12 hex digits.
@@ -375,14 +584,14 @@ func (d reqHandler) postData(w http.ResponseWriter, r *http.Request) {
 		rd.Time = time.Now()
 	}
 
-	if err := d.store.StoreRecord(sensor, rd); err != nil {
+	if err := d.store.StoreRecord(r.Context(), sensor, rd); err != nil {
 		http.Error(w, fmt.Sprintf("error storing sensor %q: %v", err), http.StatusPreconditionFailed)
 		return
 	}
 	log.Printf("data posted for sensor %q: %s", sensor, rd)
 }
 
-func handleFS(w http.ResponseWriter, fn string, fsys fs.FS, what string) {
+func handleFS(ctx context.Context, w http.ResponseWriter, fn string, fsys fs.FS, what string) {
 	content, err := fs.ReadFile(fsys, fn)
 	if err != nil {
 		http.Error(w, fmt.Sprintf("failed to read %s file %q: %v", what, fn, err), http.StatusNotFound)
@@ -400,6 +609,9 @@ func main() {
 	staticPath := flag.String("static-path", path.Join(os.Getenv("PWD"), "static"), "Path to static files")
 	user := flag.String("user", "user", "Username")
 	pass := flag.String("password", "password", "Password")
+	squeeze := flag.Int("squeeze", 0, "Squeeze the data by the number of seconds")
+	createOnly := flag.Bool("create-only", false, "Only create the database")
+
 	flag.Parse()
 
 	store, err := newDataStorage(*dataPath)
@@ -407,6 +619,18 @@ func main() {
 		log.Fatal(err)
 	}
 	defer store.Close()
+
+	if *createOnly {
+		return
+	}
+
+	if *squeeze > 0 {
+		err := store.Squeeze(time.Second*time.Duration(*squeeze), time.Now().Add(-time.Hour*3))
+		if err != nil {
+			log.Fatal(err)
+		}
+		return
+	}
 
 	d, err := NewReqHandler(store, *staticPath, *user, *pass)
 	if err != nil {
