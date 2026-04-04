@@ -77,7 +77,7 @@ func newDataStorage(dataPath string) (*dataStorage, error) {
 		db.Close()
 		return nil, fmt.Errorf("failed to create measurements table: %v", err)
 	}
-	createData = `CREATE TABLE IF NOT EXISTS squeezed ` + tableSpec + `;`
+	createData = `CREATE TEMP TABLE IF NOT EXISTS squeezed ` + tableSpec + `;`
 	if _, err := db.Exec(createData); err != nil {
 		db.Close()
 		return nil, fmt.Errorf("failed to create measurements table: %v", err)
@@ -330,15 +330,15 @@ type squeezer struct {
 	endTime          time.Time
 }
 
-func (d *dataStorage) Squeeze(interval time.Duration, endTime time.Time) error {
-	s, err := d.newSqueezer(interval, endTime)
+func (d *dataStorage) Squeeze(interval time.Duration, startTime, endTime time.Time) error {
+	s, err := d.newSqueezer(interval, startTime, endTime)
 	if err != nil {
 		return err
 	}
 	return s.Exec()
 }
 
-func (d *dataStorage) newSqueezer(interval time.Duration, endTime time.Time) (squeezer, error) {
+func (d *dataStorage) newSqueezer(interval time.Duration, startTime, endTime time.Time) (squeezer, error) {
 	if interval <= time.Second {
 		return squeezer{}, fmt.Errorf("interval %s is too small for squeeze", interval)
 	}
@@ -350,8 +350,7 @@ func (d *dataStorage) newSqueezer(interval time.Duration, endTime time.Time) (sq
 	}
 	secondsToSqueeze := int64(interval / time.Second)
 	endTime = endTime.Truncate(time.Hour)
-	// TODO: drop start time when tested.
-	startTime := endTime.Add(-time.Hour * 48)
+	startTime = startTime.Truncate(time.Hour)
 
 	tx, err := d.db.Begin()
 	if err != nil {
@@ -363,6 +362,33 @@ func (d *dataStorage) newSqueezer(interval time.Duration, endTime time.Time) (sq
 		startTime:        startTime,
 		endTime:          endTime,
 	}, nil
+}
+
+func (d *dataStorage) squeezeAll() error {
+	// The interval [-3d, -1d] -> 10 second.
+	// The interval [-7d, -3d] -> 60 second.
+	// The interval [-30d, -7d] -> 600 second.
+	// The interval [-oo, -30d] -> 3600 second.
+	endTime1 := time.Now().Add(-time.Hour * 24).Truncate(time.Hour)
+	endTime2 := endTime1.Add(-time.Hour * 24 * 2)
+	endTime3 := endTime2.Add(-time.Hour * 24 * 4)
+	endTime4 := endTime3.Add(-time.Hour * 24 * 23)
+	endTime5 := endTime4.Add(-time.Hour * 24 * 3560)
+	for _, sq := range []struct {
+		interval  time.Duration
+		startTime time.Time
+		endTime   time.Time
+	}{
+		{time.Second * 10, endTime2, endTime1},
+		{time.Second * 60, endTime3, endTime2},
+		{time.Second * 600, endTime4, endTime3},
+		{time.Second * 3600, endTime5, endTime4},
+	} {
+		if err := d.Squeeze(sq.interval, sq.startTime, sq.endTime); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 type Data struct {
@@ -635,7 +661,6 @@ func main() {
 	staticPath := flag.String("static-path", path.Join(os.Getenv("PWD"), "static"), "Path to static files")
 	user := flag.String("user", "user", "Username")
 	pass := flag.String("password", "password", "Password")
-	squeeze := flag.Int("squeeze", 0, "Squeeze the data by the number of seconds")
 	createOnly := flag.Bool("create-only", false, "Only create the database")
 
 	flag.Parse()
@@ -650,12 +675,8 @@ func main() {
 		return
 	}
 
-	if *squeeze > 0 {
-		err := store.Squeeze(time.Second*time.Duration(*squeeze), time.Now().Add(-time.Hour*3))
-		if err != nil {
-			log.Fatal(err)
-		}
-		return
+	if err := store.squeezeAll(); err != nil {
+		log.Fatal(err)
 	}
 
 	d, err := NewReqHandler(store, *staticPath, *user, *pass)
