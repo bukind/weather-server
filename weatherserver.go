@@ -38,7 +38,8 @@ var (
 
 // dataStore stores the data for the server.
 type dataStorage struct {
-	db *sql.DB
+	db         *sql.DB
+	sensorsStm *sql.Stmt
 }
 
 func newDataStorage(dataPath string) (*dataStorage, error) {
@@ -82,23 +83,30 @@ func newDataStorage(dataPath string) (*dataStorage, error) {
 		db.Close()
 		return nil, fmt.Errorf("failed to create measurements table: %v", err)
 	}
+
+	sensorsStm, err := db.Prepare(`SELECT id, name FROM sensors;`)
+	if err != nil {
+		db.Close()
+		return nil, fmt.Errorf("failed to prepare sensors statement: %v", err)
+	}
+
 	return &dataStorage{
-		db: db,
+		db:         db,
+		sensorsStm: sensorsStm,
 	}, nil
 }
 
 func (d *dataStorage) Close() {
+	d.sensorsStm.Close()
 	d.db.Close()
 }
 
 // Return the list of available sensors.
-func (d *dataStorage) Sensors() map[string]int64 {
-	// TODO: replace with prepared statement.
-	query := `SELECT id, name FROM sensors;`
-	rows, err := d.db.Query(query)
+func (d *dataStorage) Sensors() (map[string]int64, error) {
+	// TODO: cache
+	rows, err := d.sensorsStm.Query()
 	if err != nil {
-		// TODO: decide how to handle the error.
-		log.Fatal(err)
+		return nil, err
 	}
 	defer rows.Close()
 	result := make(map[string]int64)
@@ -106,15 +114,18 @@ func (d *dataStorage) Sensors() map[string]int64 {
 		var id int64
 		var name string
 		if err := rows.Scan(&id, &name); err != nil {
-			log.Fatal(err)
+			return nil, err
 		}
 		result[name] = id
 	}
-	return result
+	return result, nil
 }
 
 func (d *dataStorage) ReadData(ctx context.Context, sensor string, startDate, endDate time.Time) (Data, error) {
-	sensors := d.Sensors()
+	sensors, err := d.Sensors()
+	if err != nil {
+		return Data{}, err
+	}
 	sensorID, ok := sensors[sensor]
 	if !ok {
 		return Data{}, fmt.Errorf("sensor %q is not found", sensor)
@@ -135,7 +146,10 @@ func (d *dataStorage) ReadData(ctx context.Context, sensor string, startDate, en
 }
 
 func (d *dataStorage) StoreRecord(ctx context.Context, sensor string, rd Record) error {
-	sensors := d.Sensors()
+	sensors, err := d.Sensors()
+	if err != nil {
+		return err
+	}
 	sensorID, ok := sensors[sensor]
 	if !ok {
 		// Add a new sensor.
@@ -147,14 +161,17 @@ func (d *dataStorage) StoreRecord(ctx context.Context, sensor string, rd Record)
 		if sensorID, err = res.LastInsertId(); err != nil {
 			// The last insert id is not supported.
 			// Get the sensors again.
-			sensors = d.Sensors()
+			sensors, err = d.Sensors()
+			if err != nil {
+				return err
+			}
 			sensorID, ok = sensors[sensor]
 			if !ok {
 				return fmt.Errorf("sensor %q is not found after insert", sensor)
 			}
 		}
 	}
-	_, err := d.db.Exec(`INSERT INTO measurements (sensor_id, timestamp, temperature, pressure, humidity)
+	_, err = d.db.Exec(`INSERT INTO measurements (sensor_id, timestamp, temperature, pressure, humidity)
 	VALUES (?,?,?,?,?);`, sensorID, rd.Time, rd.Temperature, rd.Pressure, rd.Humidity)
 	return err
 }
@@ -481,9 +498,14 @@ func (d *reqHandler) ServeMux() *http.ServeMux {
 
 func (d reqHandler) handleIndex(w http.ResponseWriter, r *http.Request) {
 	log.Printf("handling index")
+	sensors, err := d.store.Sensors()
+	if err != nil {
+		httpError(w, err.Error(), http.StatusPreconditionFailed)
+		return
+	}
 	w.WriteHeader(http.StatusOK)
 	indexTemplate.Execute(w, map[string]any{
-		"Sensors": slices.Collect(maps.Keys(d.store.Sensors())),
+		"Sensors": slices.Collect(maps.Keys(sensors)),
 	})
 }
 
@@ -536,9 +558,14 @@ func (d reqHandler) handleData(w http.ResponseWriter, r *http.Request) {
 		httpError(w, err.Error(), http.StatusBadRequest)
 		return
 	}
+	sensors, err := d.store.Sensors()
+	if err != nil {
+		httpError(w, err.Error(), http.StatusPreconditionFailed)
+		return
+	}
 	sensor := r.PathValue("sensor")
 	log.Printf("sensor %s, start %s, end %s", sensor, startDate, endDate)
-	if _, ok := d.store.Sensors()[sensor]; !ok {
+	if _, ok := sensors[sensor]; !ok {
 		httpError(w, fmt.Sprintf("unknown sensor %q", sensor), http.StatusBadRequest)
 		return
 	}
