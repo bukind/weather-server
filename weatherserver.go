@@ -493,6 +493,7 @@ func (d *reqHandler) ServeMux() *http.ServeMux {
 	m.HandleFunc("GET /static/{objectname...}", d.handleStatic)
 	m.HandleFunc("GET /data/{sensor}", d.handleData)
 	m.HandleFunc("POST /upload/{sensor}", basicAuth(d.uploadSensorData, d.username, d.password))
+	m.HandleFunc("POST /tagme/{sensor}", basicAuth(d.handleTagMe, d.username, d.password))
 	return m
 }
 
@@ -626,12 +627,10 @@ func (r Record) String() string {
 
 type Records []Record
 
-func (d reqHandler) uploadSensorData(w http.ResponseWriter, r *http.Request) {
-	sensor := strings.ToLower(r.PathValue("sensor"))
+func isValidSensorName(sensor string) error {
 	if len(sensor) != 12 {
 		// We only accept MAC address, which should have 12 hex digits.
-		http.Error(w, "bad tag: should have 12 hex digits", http.StatusBadRequest)
-		return
+		return fmt.Errorf("bad tag %q: should have 12 hex digits", sensor)
 	}
 	if strings.ContainsFunc(sensor, func(r rune) bool {
 		switch {
@@ -642,7 +641,15 @@ func (d reqHandler) uploadSensorData(w http.ResponseWriter, r *http.Request) {
 		}
 		return true
 	}) {
-		http.Error(w, "bad tag: contains not a hex digit", http.StatusBadRequest)
+		return fmt.Errorf("bad tag %q: contains not a hex digit", sensor)
+	}
+	return nil
+}
+
+func (d reqHandler) uploadSensorData(w http.ResponseWriter, r *http.Request) {
+	sensor := strings.ToLower(r.PathValue("sensor"))
+	if err := isValidSensorName(sensor); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
 
@@ -668,6 +675,24 @@ func (d reqHandler) uploadSensorData(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	log.Printf("data posted for sensor %q: %s", sensor, rd)
+}
+
+func (d reqHandler) handleTagMe(w http.ResponseWriter, r *http.Request) {
+	sensor := strings.ToLower(r.PathValue("sensor"))
+	if err := isValidSensorName(sensor); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	_, err := io.ReadAll(r.Body)
+	if err != nil {
+		http.Error(w, "error reading request body", http.StatusBadRequest)
+		return
+	}
+	defer r.Body.Close()
+
+	// TODO: store tag request.
+	log.Printf("tag request posted for sensor %q", sensor)
 }
 
 func handleFS(ctx context.Context, w http.ResponseWriter, fn string, fsys fs.FS, what string) {
